@@ -3,13 +3,21 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 const cors = require('cors');
+const cloudinary = require('cloudinary').v2; 
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs').promises;
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 5000;
+
+// Cloudinary configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true
+});
 
 // Database configuration
 const pool = new Pool({
@@ -19,43 +27,89 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
   ssl: {
-    rejectUnauthorized: false, // Required for NeonDB SSL
+    rejectUnauthorized: false,
   },
 });
-
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-// Multer configuration for file uploads
+// Multer configuration for temporary file storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    cb(null, 'tmp/'); // Store files temporarily before uploading to Cloudinary
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
+    cb(null, `${Date.now()}-${file.originalname}`);
   }
 });
-const upload = multer({ storage: storage });
 
-// File deletion utility
-const deleteExistingFile = async (filePath) => {
-  if (filePath) {
-    try {
-      const fullPath = path.join(process.cwd(), filePath);
-      await fs.unlink(fullPath);
-      console.log(`Successfully deleted file: ${fullPath}`);
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        console.warn(`File not found, skipping: ${filePath}`);
-      } else {
-        console.error('Error deleting file:', err);
-      }
-    }
+// File filter for multer
+const fileFilter = (req, file, cb) => {
+  // Accept images and PDFs only
+  if (file.mimetype.startsWith('image/') || file.mimetype === 'application/pdf') {
+    cb(null, true);
+  } else {
+    cb(new Error('Not an image or PDF!'), false);
   }
 };
+
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  }
+});
+
+// File upload utility for Cloudinary
+const uploadToCloudinary = async (file) => {
+  try {
+    const result = await cloudinary.uploader.upload(file.path, {
+      folder: 'palliative-care',
+      resource_type: 'auto'
+    });
+    
+    // Delete the temporary file after uploading to Cloudinary
+    await fs.unlink(file.path);
+    
+    return {
+      url: result.secure_url,
+      public_id: result.public_id
+    };
+  } catch (error) {
+    // Delete the temporary file if upload fails
+    await fs.unlink(file.path);
+    console.error('Cloudinary upload error:', error);
+    throw error;
+  }
+};
+
+// File deletion utility for Cloudinary
+const deleteFromCloudinary = async (publicId) => {
+  try {
+    if (publicId) {
+      await cloudinary.uploader.destroy(publicId);
+      console.log(`Successfully deleted file from Cloudinary: ${publicId}`);
+    }
+  } catch (error) {
+    console.error('Error deleting from Cloudinary:', error);
+    throw error;
+  }
+};
+
+
+// Make sure tmp directory exists
+const fs = require('fs').promises;
+(async () => {
+  try {
+    await fs.mkdir('tmp', { recursive: true });
+  } catch (error) {
+    console.error('Error creating tmp directory:', error);
+  }
+})();
+
 
 async function seedAdminUsers() {
   try {
@@ -159,7 +213,7 @@ app.post('/api/admin-login', async (req, res) => {
     const token = jwt.sign(
       { username: user.username, role: 'admin' },
       process.env.JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: '24h' }
     );
 
     res.json({ token });
@@ -200,7 +254,7 @@ app.post("/api/vcm-login", async (req, res) => {
         role: 'vcm'
       },
       process.env.JWT_SECRET,
-      { expiresIn: "1h" }
+      { expiresIn: "24h" }
     );
 
     res.json({ 
@@ -215,7 +269,12 @@ app.post("/api/vcm-login", async (req, res) => {
     });
   }
 });
-
+// Logout Route
+app.post('/api/logout', (req, res) => {
+  // Since we're using JWT, we don't need to do anything server-side
+  // The client will handle removing the token
+  res.json({ message: 'Logged out successfully' });
+});
 
 
 
@@ -2246,159 +2305,209 @@ app.delete('/api/schedules/:id', async (req, res) => {
 });
 
 
-// emergency fund component 
-
-// Route to fetch all emergency_fund
+ 
+// Emergency Fund Routes
 app.get('/api/emergency-fund', async (req, res) => {
   try {
-      const result = await pool.query('SELECT * FROM emergency_fund');
-      res.status(200).json(result.rows); // Send rows as JSON response
+    const result = await pool.query('SELECT * FROM emergency_fund');
+    res.json(result.rows);
   } catch (error) {
-      console.error('Error fetching emergency_fund:', error);
-      res.status(500).json({ error: 'Failed to fetch emergency_fund' });
+    console.error('Error fetching emergency fund:', error);
+    res.status(500).json({ error: 'Failed to fetch emergency fund' });
   }
 });
 
-// Route to add/update emergency_fund (only one emergency_fund at a time)
 app.post('/api/emergency-fund', upload.fields([
-  { name: 'photo', maxCount: 1 }, 
+  { name: 'photo', maxCount: 1 },
   { name: 'qr_code', maxCount: 1 }
 ]), async (req, res) => {
-  const { name, details, account_number, ifsc_code, upi_id } = req.body;
-  const photo_url = req.files['photo'] ? req.files['photo'][0].path : null;
-  const qr_code_url = req.files['qr_code'] ? req.files['qr_code'][0].path : null;
-
   const client = await pool.connect();
-
   try {
-    // Find existing emergency_fund to delete old files
-    const existingEmergencyFund = await client.query('SELECT * FROM emergency_fund LIMIT 1');
+    const { name, details, account_number, ifsc_code, upi_id } = req.body;
     
-    if (existingEmergencyFund.rows.length > 0) {
-      // Delete old photo if new photo is uploaded
-      if (photo_url) {
-        await deleteExistingFile(existingEmergencyFund.rows[0].photo_url);
+    // Upload files to Cloudinary if present
+    let photoData = null;
+    let qrCodeData = null;
+    
+    if (req.files['photo']) {
+      photoData = await uploadToCloudinary(req.files['photo'][0], 'emergency-fund/photos');
+    }
+    
+    if (req.files['qr_code']) {
+      qrCodeData = await uploadToCloudinary(req.files['qr_code'][0], 'emergency-fund/qr-codes');
+    }
+    
+    // Get existing record to delete old files
+    const existingFund = await client.query('SELECT * FROM emergency_fund LIMIT 1');
+    
+    if (existingFund.rows.length > 0) {
+      // Delete old files from Cloudinary
+      if (existingFund.rows[0].photo_public_id && photoData) {
+        await deleteFromCloudinary(existingFund.rows[0].photo_public_id);
       }
-      
-      // Delete old QR code if new QR code is uploaded
-      if (qr_code_url) {
-        await deleteExistingFile(existingEmergencyFund.rows[0].qr_code_url);
+      if (existingFund.rows[0].qr_code_public_id && qrCodeData) {
+        await deleteFromCloudinary(existingFund.rows[0].qr_code_public_id);
       }
-
-      // Delete all existing emergency_fund
+      // Delete existing record
       await client.query('DELETE FROM emergency_fund');
     }
-
-    // Insert new emergency_fund
+    
     const query = `
       INSERT INTO emergency_fund 
-      (photo_url, name, details, account_number, ifsc_code, upi_id, qr_code_url) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7) 
+      (photo_url, photo_public_id, name, details, account_number, ifsc_code, upi_id, qr_code_url, qr_code_public_id) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
       RETURNING *
     `;
+    
     const values = [
-      photo_url, 
-      name, 
-      details, 
-      account_number, 
-      ifsc_code, 
-      upi_id, 
-      qr_code_url
+      photoData?.url || null,
+      photoData?.public_id || null,
+      name,
+      details,
+      account_number,
+      ifsc_code,
+      upi_id,
+      qrCodeData?.url || null,
+      qrCodeData?.public_id || null
     ];
 
     const result = await client.query(query, values);
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'An error occurred while adding the emergency_fund' });
+  } catch (error) {
+    console.error('Error creating emergency fund:', error);
+    res.status(500).json({ error: 'Failed to create emergency fund' });
   } finally {
     client.release();
   }
 });
 
-// Route to update emergency_fund (similar file deletion logic)
+
+// Update emergency fund
 app.put('/api/emergency-fund/:id', upload.fields([
-  { name: 'photo', maxCount: 1 }, 
+  { name: 'photo', maxCount: 1 },
   { name: 'qr_code', maxCount: 1 }
 ]), async (req, res) => {
-  const { id } = req.params;
-  const { name, details, account_number, ifsc_code, upi_id, existing_photo, existing_qr_code } = req.body;
-  const photo_url = req.files['photo'] ? req.files['photo'][0].path : existing_photo;
-  const qr_code_url = req.files['qr_code'] ? req.files['qr_code'][0].path : existing_qr_code;
-
+  const client = await pool.connect();
   try {
-    // Find existing emergency_fund to delete old files
-    const existingEmergencyFund = await pool.query('SELECT * FROM emergency_fund WHERE id = $1', [id]);
-    
-    if (existingEmergencyFund.rows.length > 0) {
-      // Delete old photo if new photo is uploaded
-      if (req.files['photo']) {
-        await deleteExistingFile(existingEmergencyFund.rows[0].photo_url);
+    const { id } = req.params;
+    const { 
+      name, 
+      details, 
+      account_number, 
+      ifsc_code, 
+      upi_id
+    } = req.body;
+
+    // Get existing emergency fund
+    const existingFund = await client.query(
+      'SELECT * FROM emergency_fund WHERE id = $1',
+      [id]
+    );
+
+    if (existingFund.rows.length === 0) {
+      return res.status(404).json({ error: 'Emergency fund not found' });
+    }
+
+    let photoData = null;
+    let qrCodeData = null;
+
+    // Handle photo upload
+    if (req.files['photo']) {
+      // Upload new photo
+      photoData = await uploadToCloudinary(req.files['photo'][0], 'emergency-fund/photos');
+      // Delete old photo if exists
+      if (existingFund.rows[0].photo_public_id) {
+        await deleteFromCloudinary(existingFund.rows[0].photo_public_id);
       }
-      
-      // Delete old QR code if new QR code is uploaded
-      if (req.files['qr_code']) {
-        await deleteExistingFile(existingEmergencyFund.rows[0].qr_code_url);
+    }
+
+    // Handle QR code upload
+    if (req.files['qr_code']) {
+      // Upload new QR code
+      qrCodeData = await uploadToCloudinary(req.files['qr_code'][0], 'emergency-fund/qr-codes');
+      // Delete old QR code if exists
+      if (existingFund.rows[0].qr_code_public_id) {
+        await deleteFromCloudinary(existingFund.rows[0].qr_code_public_id);
       }
     }
 
     const query = `
       UPDATE emergency_fund 
       SET 
-        photo_url = $2, 
-        name = $3, 
-        details = $4, 
-        account_number = $5, 
-        ifsc_code = $6, 
-        upi_id = $7, 
-        qr_code_url = $8
-      WHERE id = $1 
+        photo_url = COALESCE($1, photo_url),
+        photo_public_id = COALESCE($2, photo_public_id),
+        name = $3,
+        details = $4,
+        account_number = $5,
+        ifsc_code = $6,
+        upi_id = $7,
+        qr_code_url = COALESCE($8, qr_code_url),
+        qr_code_public_id = COALESCE($9, qr_code_public_id),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $10
       RETURNING *
     `;
+
     const values = [
-      id, 
-      photo_url, 
-      name, 
-      details, 
-      account_number, 
-      ifsc_code, 
-      upi_id, 
-      qr_code_url
+      photoData?.url || null,
+      photoData?.public_id || null,
+      name,
+      details,
+      account_number,
+      ifsc_code,
+      upi_id,
+      qrCodeData?.url || null,
+      qrCodeData?.public_id || null,
+      id
     ];
 
-    const result = await pool.query(query, values);
+    const result = await client.query(query, values);
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'An error occurred while updating the emergency_fund' });
+  } catch (error) {
+    console.error('Error updating emergency fund:', error);
+    res.status(500).json({ error: 'Failed to update emergency fund' });
+  } finally {
+    client.release();
   }
 });
 
-// Route to delete emergency_fund
+// Delete emergency fund
 app.delete('/api/emergency-fund/:id', async (req, res) => {
-  const { id } = req.params;
-
+  const client = await pool.connect();
   try {
-    // Find emergency_fund to delete associated files
-    const emergencyFund = await pool.query('SELECT * FROM emergency_fund WHERE id = $1', [id]);
-    
-    if (emergencyFund.rows.length > 0) {
-      // Delete photo file
-      await deleteExistingFile(emergencyFund.rows[0].photo_url);
-      
-      // Delete QR code file
-      await deleteExistingFile(emergencyFund.rows[0].qr_code_url);
+    const { id } = req.params;
+
+    // Get emergency fund details before deletion
+    const emergencyFund = await client.query(
+      'SELECT * FROM emergency_fund WHERE id = $1',
+      [id]
+    );
+
+    if (emergencyFund.rows.length === 0) {
+      return res.status(404).json({ error: 'Emergency fund not found' });
     }
 
-    // Delete emergency_fund from database
-    await pool.query('DELETE FROM emergency_fund WHERE id = $1', [id]);
+    // Delete photo from Cloudinary if exists
+    if (emergencyFund.rows[0].photo_public_id) {
+      await deleteFromCloudinary(emergencyFund.rows[0].photo_public_id);
+    }
+
+    // Delete QR code from Cloudinary if exists
+    if (emergencyFund.rows[0].qr_code_public_id) {
+      await deleteFromCloudinary(emergencyFund.rows[0].qr_code_public_id);
+    }
+
+    // Delete record from database
+    await client.query('DELETE FROM emergency_fund WHERE id = $1', [id]);
+    
     res.json({ message: 'Emergency fund deleted successfully' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'An error occurred while deleting the emergency fund' });
+  } catch (error) {
+    console.error('Error deleting emergency fund:', error);
+    res.status(500).json({ error: 'Failed to delete emergency fund' });
+  } finally {
+    client.release();
   }
 });
-
 
 
 // patient assignment component
@@ -2942,94 +3051,52 @@ app.put('/api/health-status/:patient_id', async (req, res) => {
 // Get all equipment
 app.get('/api/equipment', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM equipment ORDER BY created_at DESC'
-    );
+    const result = await pool.query('SELECT * FROM equipment ORDER BY created_at DESC');
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Error fetching equipment' });
   }
 });
 
-// Changed equipment route to be more specific
+// Get a specific equipment item
 app.get('/api/inventory/equipment/:id', async (req, res) => {
-  const client = await pool.connect();
   try {
     const { id } = req.params;
-    
     const equipmentId = parseInt(id);
     if (isNaN(equipmentId)) {
       return res.status(400).json({ error: 'Invalid equipment ID format' });
     }
-    
-    const result = await client.query(
-      'SELECT * FROM equipment WHERE id = $1',
-      [equipmentId]
-    );
-    
+    const result = await pool.query('SELECT * FROM equipment WHERE id = $1', [equipmentId]);
+
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Equipment not found' });
     }
-    
+
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Equipment query error:', error);
     res.status(500).json({ error: 'Internal server error' });
-  } finally {
-    client.release();
   }
 });
 
-// Add new equipment with image upload
+
 app.post('/api/equipment', upload.single('image'), async (req, res) => {
-  const { name, type, quantity, status, condition, notes } = req.body;
-  const image_url = req.file ? `/uploads/${req.file.filename}` : null;
-
-  try {
-    const result = await pool.query(
-      'INSERT INTO equipment (name, type, quantity, status, condition, notes, image_url) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [name, type, quantity, status, condition, notes, image_url]
-    );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error adding equipment' });
-  }
-});
-
-// Update equipment with optional image upload
-app.put('/api/equipment/:id', upload.single('image'), async (req, res) => {
-  const { id } = req.params;
-  const { name, type, quantity, status, condition, notes } = req.body;
   const client = await pool.connect();
-
   try {
-    // Find existing equipment to delete old image
-    const existingEquipment = await client.query('SELECT image_url FROM equipment WHERE id = $1', [id]);
-
-    let image_url = null;
+    const { name, type, quantity, status, condition, notes } = req.body;
+    let imageData = null;
+    
     if (req.file) {
-      // Delete old image if it exists
-      if (existingEquipment.rows[0]?.image_url) {
-        await deleteExistingFile(existingEquipment.rows[0].image_url);
-      }
-      image_url = `/uploads/${req.file.filename}`;
+      imageData = await uploadToCloudinary(req.file, 'equipment');
     }
-
-    let updateQuery = `
-      UPDATE equipment 
-      SET name = $1, 
-          type = $2, 
-          quantity = $3, 
-          status = $4, 
-          condition = $5, 
-          notes = $6,
-          image_url = COALESCE($7, image_url),
-          updated_at = CURRENT_TIMESTAMP 
-      WHERE id = $8 
+    
+    const query = `
+      INSERT INTO equipment 
+      (name, type, quantity, status, condition, notes, image_url, image_public_id, created_at, updated_at) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) 
       RETURNING *
     `;
-
+    
     const values = [
       name,
       type,
@@ -3037,49 +3104,103 @@ app.put('/api/equipment/:id', upload.single('image'), async (req, res) => {
       status,
       condition,
       notes,
-      image_url,
-      id
+      imageData?.url || null,
+      imageData?.public_id || null
     ];
 
-    const result = await client.query(updateQuery, values);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Equipment not found' });
-    }
-
+    const result = await client.query(query, values);
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Error updating equipment' });
+  } catch (error) {
+    console.error('Error creating equipment:', error);
+    res.status(500).json({ error: 'Failed to create equipment' });
   } finally {
     client.release();
   }
 });
 
-
-// Delete equipment
-app.delete('/api/equipment/:id', async (req, res) => {
-  const { id } = req.params;
-  
+app.put('/api/equipment/:id', upload.single('image'), async (req, res) => {
+  const client = await pool.connect();
   try {
-    // Get the image_url before deleting the record
-    const equipment = await pool.query('SELECT image_url FROM equipment WHERE id = $1', [id]);
+    const { id } = req.params;
+    const { name, type, quantity, status, condition, notes } = req.body;
     
-    // Delete the record from the database
-    const result = await pool.query('DELETE FROM equipment WHERE id = $1', [id]);
-    
-    // If there was an image, delete the file
-    if (equipment.rows[0]?.image_url) {
-      const filename = equipment.rows[0].image_url.split('/').pop();
-      const filePath = path.join('uploads', filename);
-      fs.unlink(filePath, (err) => {
-        if (err) console.error('Error deleting file:', err);
-      });
+    // Get existing equipment
+    const existingEquipment = await client.query('SELECT * FROM equipment WHERE id = $1', [id]);
+    if (existingEquipment.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
     }
     
+    let imageData = null;
+    if (req.file) {
+      // Upload new image
+      imageData = await uploadToCloudinary(req.file, 'equipment');
+      // Delete old image
+      if (existingEquipment.rows[0].image_public_id) {
+        await deleteFromCloudinary(existingEquipment.rows[0].image_public_id);
+      }
+    }
+    
+    const query = `
+      UPDATE equipment 
+      SET name = $1,
+          type = $2,
+          quantity = $3,
+          status = $4,
+          condition = $5,
+          notes = $6,
+          image_url = COALESCE($7, image_url),
+          image_public_id = COALESCE($8, image_public_id),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING *
+    `;
+    
+    const values = [
+      name,
+      type,
+      quantity,
+      status,
+      condition,
+      notes,
+      imageData?.url || null,
+      imageData?.public_id || null,
+      id
+    ];
+
+    const result = await client.query(query, values);
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating equipment:', error);
+    res.status(500).json({ error: 'Failed to update equipment' });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/equipment/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    
+    // Get equipment details before deletion
+    const equipment = await client.query('SELECT * FROM equipment WHERE id = $1', [id]);
+    if (equipment.rows.length === 0) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    
+    // Delete image from Cloudinary if exists
+    if (equipment.rows[0].image_public_id) {
+      await deleteFromCloudinary(equipment.rows[0].image_public_id);
+    }
+    
+    // Delete equipment record
+    await client.query('DELETE FROM equipment WHERE id = $1', [id]);
     res.json({ message: 'Equipment deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ error: 'Error deleting equipment' });
+  } catch (error) {
+    console.error('Error deleting equipment:', error);
+    res.status(500).json({ error: 'Failed to delete equipment' });
+  } finally {
+    client.release();
   }
 });
 
