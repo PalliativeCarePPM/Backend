@@ -3469,5 +3469,5 @@ app.put("/api/statistics", async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Server running on neon db`);
+  console.log(`Server running `);
 });
