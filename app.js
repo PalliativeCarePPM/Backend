@@ -34,11 +34,12 @@ const pool = new Pool({
 // Middleware
 app.use(
   cors({
-    origin: "https://palliativepookkottumpadam.com", 
+    origin: ["https://palliativepookkottumpadam.com", "https://www.palliativepookkottumpadam.com"],
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-    credentials: true, // Enable cookies if needed
+    credentials: true,
   })
 );
+
 app.use(express.json());
 
 // Multer configuration for temporary file storage
